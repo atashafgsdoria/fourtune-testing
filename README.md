@@ -1,0 +1,648 @@
+## CHRIS 
+
+Community Health Records and Information System is an offline-first healthcare application for community health workers in the Philippines, built with React Native (Expo), SQLite, and HAPI FHIR R4.
+
+---
+
+## Tech Stack
+
+### Frontend
+- **Framework:** React Native, Expo SDK 54, TypeScript, Expo Router
+- **Database:** SQLite (expo-sqlite) — local source of truth
+
+### Backend
+- **HAPI FHIR** JPA Server (R4) + PostgreSQL — clinical data store
+- **OpenHIM** — interoperability layer / transaction router
+- **OpenCR** — Master Patient Index (patient deduplication)
+- **OpenSearch** — fuzzy matching engine for OpenCR
+- **BridgeLink** — healthcare integration engine (HL7 v2/v3, FHIR, DICOM, EDI)
+- **MongoDB** — OpenHIM transaction logs
+
+### Standards
+- HL7 FHIR R4
+- PH Core Implementation Guide
+- PSGC (Philippine Standard Geographic Code)
+
+---
+
+## Getting Started
+
+### Prerequisites
+
+- Node.js 18+
+- npm or yarn
+- Expo CLI (`npx expo`)
+- Android emulator or physical device
+- Docker & Docker Compose (for backend services)
+- OpenSSL (for generating OpenCR certificates)
+- Git Bash or WSL (Windows only, for running shell scripts)
+
+### 1. Backend Setup
+
+The backend must be running before the mobile app can sync data.
+
+```bash
+cd backend
+
+# Generate OpenCR TLS certificates (required, one-time)
+cd opencr
+bash generate-certs.sh
+cd ..
+
+# Start all services
+docker compose up -d
+
+# Wait ~90 seconds for all services to initialize, then verify:
+docker compose ps
+docker logs opencr --tail 5   # Should show "Done loading Default data"
+```
+
+Services that will start:
+| Service | Port | Purpose |
+|---------|------|---------|
+| HAPI FHIR | 8080 | Main clinical data store |
+| OpenHIM (HTTP) | 5001 | Transaction router (mobile app connects here) |
+| OpenHIM Console | 9000 | Admin UI for OpenHIM |
+| OpenCR | 3004 | Patient deduplication / MPI (HTTPS) |
+| OpenCR HAPI FHIR | 8090 | Internal demographics store |
+| OpenSearch | 9200 | Fuzzy matching engine |
+| PostgreSQL | 5432 | Database for HAPI FHIR |
+| MongoDB | — | OpenHIM transaction store |
+| BridgeLink | 8443, 8082 | Healthcare integration engine (HL7 v2/v3, FHIR, DICOM, CSV) |
+
+### 2. Configure the Mobile App
+
+Update `src/constants/api.ts` with your machine's local IP:
+
+```typescript
+export const API_URL = 'http://<YOUR_IP>:5001/fhir';
+```
+
+Find your IP:
+- **Windows:** Run `ipconfig` → Wi-Fi/Ethernet IPv4 address (e.g., `192.168.1.100`)
+- **macOS:** Run `ifconfig en0` → `inet` address
+- **Linux:** Run `ip addr show` → look for your LAN IP
+
+### 3. Install & Run the App
+
+```bash
+npm install
+npx expo start --port 8084
+```
+
+Open on:
+- [Android emulator](https://docs.expo.dev/workflow/android-studio-emulator/)
+- [iOS simulator](https://docs.expo.dev/workflow/ios-simulator/)
+- [Expo Go](https://expo.dev/go)
+
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────┐
+│       React Native (UI)         │
+└────────────────┬────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────┐
+│         SQLite (offline)        │
+└────────────────┬────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────┐
+│       Sync Queue (pending)      │
+└────────────────┬────────────────┘
+                 │
+                 ▼
+┌─────────────────────────────────────────────────────┐
+│        OpenHIM (port 5001 — transaction router)     │
+├──────────────────────────┬──────────────────────────┤
+│  POST/PUT /fhir/Patient  │     POST /fhir (Bundle)  │
+└────────────┬─────────────┴─────────────┬────────────┘
+             │                           │
+             ▼                           ▼
+┌────────────────────────┐   ┌────────────────────────┐
+│   OpenCR (port 3004)   │   │  HAPI FHIR (port 8080) │
+│   Patient Deduplication│   │  Clinical Data Store   │
+├────────────────────────┤   ├────────────────────────┤
+│  OpenSearch (port 9200)│   │  PostgreSQL (port 5432)│
+│  OpenCR HAPIFHIR (8090)│   │                        │
+└────────────────────────┘   └────────────────────────┘
+
+┌─────────────────────────────────────────────────────┐
+│      BridgeLink (port 8443 — integration engine)    │
+├─────────────────────────────────────────────────────┤
+│  Receives: HL7 v2/v3, CSV, DICOM, EDI, JSON        │
+│  Transforms → FHIR JSON                            │
+│  HTTP Sender → OpenHIM (port 5001)                  │
+│  OpenHIM routes Patient → OpenCR (dedup)            │
+└─────────────────────────────────────────────────────┘
+```
+
+The app works **completely offline**. All data is saved locally first, then synchronized when connectivity is available. Patient resources are routed through OpenCR for deduplication, while clinical resources (Encounters, Observations) go directly to HAPI FHIR.
+
+BridgeLink handles external system integrations (HL7 v2 from hospital HIS/LIS, CSV imports, DICOM from radiology, EDI for billing) by transforming them into FHIR JSON and routing through the same OpenHIM → OpenCR/HAPI FHIR pipeline.
+
+---
+
+## Project Structure
+
+```
+src/
+├── app/                        # Expo Router screens
+│   ├── (tabs)/                 # Tab navigation
+│   │   ├── index.tsx           # Home
+│   │   ├── patients.tsx        # Patient list
+│   │   ├── tasks.tsx           # Tasks
+│   │   └── settings.tsx        # Settings
+│   ├── register-patient.tsx    # Multi-step registration wizard
+│   └── _layout.tsx             # Root layout (fonts, migrations)
+│
+├── components/
+│   ├── register/               # Registration wizard steps
+│   │   ├── StepBasicDemographics.tsx
+│   │   ├── StepIdentifiers.tsx
+│   │   ├── StepContact.tsx
+│   │   ├── StepAddress.tsx
+│   │   └── StepReview.tsx
+│   ├── FloatingTabBar.tsx
+│   └── ScrollContext.tsx
+│
+├── data/
+│   ├── philippineAddress.ts    # PSGC lookup service (regions/provinces/cities from JSON, barangays from SQLite)
+│   └── templates/              # Complete PSGC dataset (source: PSA via isaacdarcilla/philippine-addresses)
+│       ├── psgc-regions.json       (17 regions, 2.2 KB)
+│       ├── psgc-provinces.json     (88 provinces, 8.4 KB)
+│       ├── psgc-cities.json        (1,647 cities/municipalities, 183 KB)
+│       └── psgc-barangays.json     (42,029 barangays, 4.7 MB — seeded into SQLite on first launch)
+│
+├── db/
+│   ├── database.ts             # SQLite connection
+│   ├── migrations.ts           # Table creation
+│   ├── resourceRepository.ts   # FHIR resource CRUD
+│   └── terminologyRepository.ts
+│
+├── fhir/
+│   ├── fhirClient.ts           # HTTP client for HAPI FHIR
+│   ├── patientService.ts       # Patient operations
+│   ├── encounterService.ts
+│   └── observationService.ts
+│
+├── hooks/
+│   ├── usePatients.ts          # Patient list hook
+│   └── useSync.ts
+│
+├── models/
+│   └── Patient.ts              # FHIR Patient types & form data model
+│
+├── sync/
+│   ├── syncQueue.ts            # Queue CRUD operations
+│   ├── syncService.ts          # Sync orchestration
+│   ├── syncWorker.ts           # Process pending queue items
+│   └── networkMonitor.ts       # Online/offline detection
+│
+├── terminology/
+│   ├── terminologyService.ts
+│   ├── valueSetService.ts
+│   └── codeSystemService.ts
+│
+└── utils/
+    ├── validation.ts           # Form validation per step
+    └── patientMapper.ts        # Form data → FHIR Patient resource
+```
+
+---
+
+## Register Patient Module
+
+A multi-step wizard for registering patients that is PH Core-compliant and works fully offline.
+
+### User Flow
+
+| Step | Screen | Fields |
+|------|--------|--------|
+| 1 | Basic Demographics | First Name*, Middle Name, Last Name*, Sex*, Birth Date* |
+| 2 | Identifiers | PhilHealth Number, PhilSys National ID, Local Health Record # |
+| 3 | Contact | Mobile Number, Email Address |
+| 4 | Address | Region, Province, City/Municipality, Barangay, House No./Street |
+| 5 | Review & Confirm | Summary of all data with edit buttons |
+
+### Data Flow
+
+```
+User fills form
+      ↓
+Validation (per step)
+      ↓
+mapFormToFHIRPatient() → generates PH Core-compliant FHIR R4 Patient JSON
+      ↓
+saveResource() → INSERT into SQLite `resources` table
+      ↓
+queueCreate() → INSERT into SQLite `sync_queue` table
+      ↓
+Navigate back to Patients list
+      ↓
+(Later) syncNow() → POST /Patient to HAPI FHIR
+```
+
+### PH Core Compliance
+
+The generated Patient resource follows the PH Core Patient profile:
+
+```json
+{
+  "resourceType": "Patient",
+  "meta": {
+    "profile": ["https://fhir.doh.gov.ph/phcore/StructureDefinition/ph-core-patient"]
+  },
+  "active": true,
+  "name": [{
+    "use": "official",
+    "family": "Dela Cruz",
+    "given": ["Juan", "Santos"]
+  }],
+  "gender": "male",
+  "birthDate": "1995-05-15",
+  "identifier": [{
+    "system": "https://www.philhealth.gov.ph/members",
+    "value": "01-234567890-1"
+  }],
+  "address": [{
+    "use": "home",
+    "text": "123 Rizal St., Diliman, Quezon City, NCR",
+    "country": "PH",
+    "extension": [{
+      "url": "https://fhir.doh.gov.ph/phcore/StructureDefinition/region",
+      "valueCoding": {
+        "system": "https://psa.gov.ph/classification/psgc",
+        "code": "1300000000",
+        "display": "NCR (National Capital Region)"
+      }
+    }]
+  }]
+}
+```
+
+### Address Extensions (PH Core)
+
+The address field uses PH Core extensions to store coded PSGC values alongside the display text. These extensions are defined in the [PH Core Address profile](https://build.fhir.org/ig/UP-Manila-SILab/ph-core/StructureDefinition-ph-core-address.html).
+
+| Level | Extension URL | Context |
+|-------|--------------|---------|
+| Region | `https://fhir.doh.gov.ph/phcore/StructureDefinition/region` | Address |
+| Province | `https://fhir.doh.gov.ph/phcore/StructureDefinition/province` | Address |
+| City/Municipality | `https://fhir.doh.gov.ph/phcore/StructureDefinition/city-municipality` | Address |
+| Barangay | `https://fhir.doh.gov.ph/phcore/StructureDefinition/barangay` | Address |
+
+Each extension carries a `valueCoding` with:
+- **system:** `https://psa.gov.ph/classification/psgc`
+- **code:** The PSGC code (e.g., `01` for Region I, `0128` for Ilocos Norte)
+- **display:** The human-readable name
+
+Example address with all extensions:
+
+```json
+{
+  "use": "home",
+  "text": "123 Rizal St., Adams, Ilocos Norte, Region I (Ilocos Region)",
+  "line": ["123 Rizal St."],
+  "city": "Adams",
+  "district": "Adams",
+  "state": "Ilocos Norte",
+  "country": "PH",
+  "extension": [
+    {
+      "url": "https://fhir.doh.gov.ph/phcore/StructureDefinition/region",
+      "valueCoding": {
+        "system": "https://psa.gov.ph/classification/psgc",
+        "code": "01",
+        "display": "Region I (Ilocos Region)"
+      }
+    },
+    {
+      "url": "https://fhir.doh.gov.ph/phcore/StructureDefinition/province",
+      "valueCoding": {
+        "system": "https://psa.gov.ph/classification/psgc",
+        "code": "0128",
+        "display": "Ilocos Norte"
+      }
+    },
+    {
+      "url": "https://fhir.doh.gov.ph/phcore/StructureDefinition/city-municipality",
+      "valueCoding": {
+        "system": "https://psa.gov.ph/classification/psgc",
+        "code": "012801",
+        "display": "Adams"
+      }
+    },
+    {
+      "url": "https://fhir.doh.gov.ph/phcore/StructureDefinition/barangay",
+      "valueCoding": {
+        "system": "https://psa.gov.ph/classification/psgc",
+        "code": "012801001",
+        "display": "Adams (Pob.)"
+      }
+    }
+  ]
+}
+```
+
+---
+
+## PSGC Address Data
+
+### Source
+
+The complete Philippine Standard Geographic Code (PSGC) dataset is sourced from the community-maintained repository [isaacdarcilla/philippine-addresses](https://github.com/isaacdarcilla/philippine-addresses), which is based on official PSA publications.
+
+### Dataset
+
+| File | Records | Size | Storage |
+|------|---------|------|---------|
+| `psgc-regions.json` | 17 | 2.2 KB | Bundled JSON (in-memory) |
+| `psgc-provinces.json` | 88 | 8.4 KB | Bundled JSON (in-memory) |
+| `psgc-cities.json` | 1,647 | 183 KB | Bundled JSON (in-memory) |
+| `psgc-barangays.json` | 42,029 | 4.7 MB | Seeded into SQLite on first launch |
+
+### How It Works Offline
+
+- **Regions, provinces, and cities** are imported directly from JSON at build time. They're small enough to filter in-memory for instant dropdown population.
+- **Barangays** (42,029 records) are loaded into a dedicated SQLite table (`barangays`) on first app launch, then queried by `city_code` via an indexed column. This keeps memory usage low and lookups fast.
+
+```typescript
+import { getRegions, getProvincesByRegion, getCitiesByProvince, getBarangaysByCity } from '@/src/data/philippineAddress';
+
+const regions = getRegions();                         // 17 regions
+const provinces = getProvincesByRegion('01');          // Provinces in Region I
+const cities = getCitiesByProvince('0128');            // Cities in Ilocos Norte
+const barangays = getBarangaysByCity('012801');        // Barangays in Adams
+```
+
+### Cascading Behavior
+
+```
+Region selected → filter provinces by region_code
+Province selected → filter cities by province_code
+City selected → query barangays from SQLite by city_code
+```
+
+Each selection clears dependent fields below it.
+
+### Updating the Dataset
+
+To update with newer PSA data:
+
+```bash
+# Download updated files from the source repository
+curl -o src/data/templates/psgc-regions.json https://raw.githubusercontent.com/isaacdarcilla/philippine-addresses/main/region.json
+curl -o src/data/templates/psgc-provinces.json https://raw.githubusercontent.com/isaacdarcilla/philippine-addresses/main/province.json
+curl -o src/data/templates/psgc-cities.json https://raw.githubusercontent.com/isaacdarcilla/philippine-addresses/main/city.json
+curl -o src/data/templates/psgc-barangays.json https://raw.githubusercontent.com/isaacdarcilla/philippine-addresses/main/barangay.json
+```
+
+After updating, clear the app data or uninstall/reinstall to re-seed the barangays table.
+
+---
+
+## PH Core FHIR Package
+
+The app generates FHIR resources that conform to the [PH Core Implementation Guide](https://build.fhir.org/ig/UP-Manila-SILab/ph-core/) developed by the UP Manila Standards and Interoperability Lab.
+
+**Package source:** https://build.fhir.org/ig/UP-Manila-SILab/ph-core/package.tgz
+
+### What's in the PH Core IG
+
+| Resource Type | Purpose |
+|---------------|---------|
+| **StructureDefinitions** | Profile rules for Patient, Observation, Encounter, etc. |
+| **CodeSystems** | PSGC (geographic codes), PSOC (occupations), PSCED (education), disability types |
+| **ValueSets** | Curated lists of regions, provinces, cities, barangays, drugs, indigenous groups |
+| **NamingSystems** | Identifier URIs for PhilHealth, PhilSys, HCPN, DOH NHFR |
+
+### Profiles Used
+
+| Profile | URL |
+|---------|-----|
+| PH Core Patient | `https://fhir.doh.gov.ph/phcore/StructureDefinition/ph-core-patient` |
+| PH Core Address | `https://fhir.doh.gov.ph/phcore/StructureDefinition/ph-core-address` |
+| PH Core Name | `https://fhir.doh.gov.ph/phcore/StructureDefinition/ph-core-name` |
+
+### Identifier Systems (NamingSystems)
+
+| Identifier | System URI |
+|------------|-----------|
+| PhilHealth Member ID | `https://www.philhealth.gov.ph/members` |
+| PhilSys National ID | `https://psa.gov.ph/philsys` |
+| Local Health Record | `urn:oid:2.16.840.1.113883.3.88.12.80.2` |
+
+### Relationship to PSGC Data
+
+The PH Core IG defines the **extension URLs and coding system URI** (`https://psa.gov.ph/classification/psgc`) for address components. The actual PSGC codes come from the complete PSA dataset (bundled in `src/data/templates/`). The IG's own `CodeSystem-PSGC.json` is a fragment — we use the full dataset instead for production coverage.
+
+---
+
+## SQLite Schema
+
+```sql
+CREATE TABLE resources (
+  id TEXT PRIMARY KEY,
+  resourceType TEXT NOT NULL,
+  data TEXT NOT NULL,          -- Complete FHIR JSON
+  synced INTEGER DEFAULT 0     -- 0 = pending, 1 = synced
+);
+
+CREATE TABLE sync_queue (
+  id TEXT PRIMARY KEY,
+  resourceId TEXT NOT NULL,
+  operation TEXT NOT NULL,     -- CREATE | UPDATE | DELETE
+  status TEXT NOT NULL         -- PENDING | COMPLETED | FAILED
+);
+
+CREATE TABLE terminology_codes (
+  code TEXT PRIMARY KEY,
+  display TEXT,
+  system TEXT
+);
+
+CREATE TABLE barangays (
+  brgy_code TEXT PRIMARY KEY,
+  brgy_name TEXT NOT NULL,
+  city_code TEXT NOT NULL,
+  province_code TEXT NOT NULL,
+  region_code TEXT NOT NULL
+);
+
+CREATE INDEX idx_barangays_city_code ON barangays(city_code);
+```
+
+The `barangays` table is seeded on first launch from `psgc-barangays.json` (42,029 rows, batch-inserted in groups of 500).
+
+---
+
+## API Configuration
+
+The backend server address is configured in `src/constants/api.ts`:
+
+```typescript
+// OpenHIM HTTP transaction port — routes Patient to OpenCR, everything else to HAPI FHIR
+export const API_URL = 'http://<YOUR_SERVER_IP>:5001/fhir';
+```
+
+Replace `<YOUR_SERVER_IP>` with the IP address of the machine running the backend Docker services. To find your IP:
+
+- **Windows:** `ipconfig` → look for your Wi-Fi or Ethernet IPv4 address
+- **macOS/Linux:** `ifconfig` or `ip addr` → look for your local network IP (e.g., 192.168.x.x)
+
+> The mobile app connects to OpenHIM (port 5001), which routes Patient resources through OpenCR for deduplication, and all other resources directly to HAPI FHIR.
+
+
+---
+## Resources Terms
+- Patient = Who is receiving care?
+- Group = Who belongs together?
+- Encounter = When did care happen?
+- Observation = What was measured?
+
+---
+
+## BridgeLink (Healthcare Integration Engine)
+
+BridgeLink is an open-source fork of Mirth Connect that handles healthcare-specific data formats (HL7 v2/v3, DICOM, EDI) and general formats (CSV, JSON, XML). It transforms incoming data into FHIR resources and routes them through OpenHIM.
+
+### How BridgeLink connects to OpenHIM → OpenCR
+
+BridgeLink and OpenHIM are on the same Docker network (`openhim-network`). BridgeLink's destination channels use an **HTTP Sender** connector that posts FHIR JSON directly to OpenHIM's internal Docker hostname:
+
+```
+BridgeLink Channel (Destination HTTP Sender)
+    │
+    │  POST http://openhim-core:5001/fhir/Patient
+    │  Headers:
+    │    Content-Type: application/fhir+json
+    │    Accept: application/fhir+json
+    │    x-openhim-clientid: chris-mobile
+    │
+    ▼
+OpenHIM (port 5001)
+    │  Channel matches: POST /fhir/Patient → routes to OpenCR
+    ▼
+OpenCR (port 3001 HTTP proxy inside Docker)
+    │  Deduplicates patient using decision rules
+    │  Assigns/links golden record (CRUID)
+    ▼
+OpenCR HAPI FHIR (port 8090) — patient stored
+OpenSearch (port 9200) — patient indexed for future matching
+```
+
+The key connection details:
+- **URL:** `http://openhim-core:5001/fhir/Patient` (Docker internal DNS)
+- **Header:** `x-openhim-clientid: chris-mobile` identifies the source to OpenHIM
+- **Same network:** Both services are on `openhim-network` in docker-compose
+
+### Access BridgeLink Administrator
+
+```
+URL: https://localhost:8443
+Launcher: https://github.com/Innovar-Healthcare/BridgeLink-launcher/releases
+Default login: admin / admin
+```
+
+> The web-based Java Web Start launcher has signing issues. Use the standalone **BridgeLink Launcher** desktop app instead.
+
+### CSV Patient Import Channel
+
+A working channel that imports patients from CSV and routes them through OpenCR for deduplication.
+
+**Endpoint:** `http://localhost:8082/import/csv` (POST, text/plain)
+
+**CSV Format:**
+```csv
+first_name,last_name,gender,birthdate,phone
+Juan,Dela Cruz,male,1990-05-15,09171234567
+Maria,Santos,female,1985-03-20,09189876543
+```
+
+**Channel Configuration:**
+
+| Setting | Value |
+|---------|-------|
+| Source Connector | HTTP Listener, port 8082 |
+| Source Inbound Data Type | Delimited Text (comma, header row) |
+| Source Outbound Data Type | XML |
+| Destination Connector | HTTP Sender |
+| Destination URL | `http://openhim-core:5001/fhir/Patient` |
+| Destination Method | POST |
+| Destination Content-Type | `application/fhir+json` |
+
+**Transformer (E4X JavaScript):**
+
+```javascript
+// E4X XML access - msg is the root <delimited> element
+var firstName = msg.row.column1.toString();
+var lastName = msg.row.column2.toString();
+var gender = msg.row.column3.toString().toLowerCase();
+var birthDate = msg.row.column4.toString();
+var phone = msg.row.column5.toString();
+
+if (gender === 'm') gender = 'male';
+else if (gender === 'f') gender = 'female';
+else if (gender !== 'male' && gender !== 'female') gender = 'unknown';
+
+var uuid = java.util.UUID.randomUUID().toString();
+
+var patient = {
+    resourceType: 'Patient',
+    id: uuid,
+    meta: { profile: ['https://fhir.doh.gov.ph/phcore/StructureDefinition/ph-core-patient'] },
+    identifier: [{ system: 'http://openclientregistry.org/fhir/internalid', value: uuid }],
+    active: true,
+    name: [{ use: 'official', family: lastName, given: [firstName] }],
+    gender: gender
+};
+
+if (birthDate && birthDate.length > 0) patient.birthDate = birthDate;
+if (phone && phone.length > 0) patient.telecom = [{ system: 'phone', value: phone, use: 'mobile' }];
+
+msg = JSON.stringify(patient);
+```
+
+**Testing:**
+```powershell
+$csv = "first_name,last_name,gender,birthdate,phone`nJuan,Dela Cruz,male,1990-05-15,09171234567"
+Invoke-WebRequest -Uri "http://localhost:8082/import/csv" -Method POST -Body $csv -ContentType "text/plain" -UseBasicParsing
+```
+
+**Data Flow:**
+```
+CSV text → BridgeLink HTTP Listener (port 8082)
+    → Delimited Text parser (splits by row, skips header)
+    → Transformer (E4X JavaScript: CSV XML → FHIR Patient JSON)
+    → HTTP Sender → OpenHIM (port 5001, /fhir/Patient)
+    → OpenHIM routes to OpenCR
+    → OpenCR deduplicates → assigns golden record
+    → Stored in OpenCR HAPI FHIR (port 8090)
+```
+
+### Key Notes for Channel Development
+
+- BridgeLink parses Delimited Text into E4X XML: `<delimited><row><column1>...</column1></row></delimited>`
+- Access columns with: `msg.row.column1.toString()` (not bracket notation)
+- Set Source Outbound to `XML` so the Destination transformer receives a parsed XML object
+- The `x-openhim-clientid: chris-mobile` header is required for OpenHIM to accept the request
+- Each CSV row becomes a separate message when "Split Batch By: Record" is enabled
+
+
+## References
+
+- [HL7 FHIR R4 Patient](https://hl7.org/fhir/R4/patient.html)
+- [PH Core Implementation Guide](https://build.fhir.org/ig/UP-Manila-SILab/ph-core/)
+- [PH Core Patient Profile](https://build.fhir.org/ig/UP-Manila-SILab/ph-core/StructureDefinition-ph-core-patient.html)
+- [PH Core Address Profile](https://build.fhir.org/ig/UP-Manila-SILab/ph-core/StructureDefinition-ph-core-address.html)
+- [PSGC — Philippine Statistics Authority](https://psa.gov.ph/classification/psgc)
+- [PSGC Dataset (JSON)](https://github.com/isaacdarcilla/philippine-addresses)
+- [Expo Documentation (v54)](https://docs.expo.dev/versions/v54.0.0/)
+- [BridgeLink (GitHub)](https://github.com/Innovar-Healthcare/BridgeLink)
+- [BridgeLink Container (Docker)](https://github.com/Innovar-Healthcare/bridgelink-container)
+- [BridgeLink Launcher](https://github.com/Innovar-Healthcare/BridgeLink-launcher/releases)
