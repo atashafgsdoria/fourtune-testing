@@ -1,0 +1,12 @@
+hapi:
+  fhir:
+    version: R4
+    subscription:
+      resthook_enabled: true
+      websocket_enabled: false
+
+spring:
+  datasource:
+    url: jdbc:postgresql://postgres:5432/hapi
+    username: admin
+    password: admin

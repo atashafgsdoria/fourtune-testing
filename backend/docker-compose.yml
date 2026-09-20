@@ -1,0 +1,337 @@
+services:
+  # ===========================================
+  # HAPI FHIR Server
+  # ===========================================
+  hapi-fhir:
+    image: hapiproject/hapi:latest
+    container_name: hapi-fhir
+    user: root
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/hapi
+      SPRING_DATASOURCE_USERNAME: admin
+      SPRING_DATASOURCE_PASSWORD: admin
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: org.postgresql.Driver
+      SPRING_JPA_PROPERTIES_HIBERNATE_DIALECT: org.hibernate.dialect.PostgreSQLDialect
+      HAPI_FHIR_SUBSCRIPTION_RESTHOOK_ENABLED: "true"
+      HAPI_FHIR_SUBSCRIPTION_WEBSOCKET_ENABLED: "false"
+    volumes:
+      - hapi-data:/data
+      - ./hapi/application.yaml:/app/config/application.yaml:ro
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - openhim-network
+
+  # ===========================================
+  # PostgreSQL
+  # ===========================================
+  postgres:
+    image: postgres:15-alpine
+    container_name: postgres
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./postgres/init-databases.sql:/docker-entrypoint-initdb.d/init-databases.sql
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - openhim-network
+
+  # ===========================================
+  # MongoDB
+  # ===========================================
+  mongo:
+    image: mongo:4.4
+    container_name: openhim-mongo
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - openhim-network
+
+  # ===========================================
+  # OpenHIM Core
+  # ===========================================
+  openhim-core:
+    image: jembi/openhim-core:latest
+    container_name: openhim-core
+    environment:
+      - mongo_url=mongodb://mongo/openhim
+      - mongo_atnaUrl=mongodb://mongo/openhim
+      - NODE_TLS_REJECT_UNAUTHORIZED=0
+    ports:
+      - "5000:5000"
+      - "5001:5001"
+      - "5544:5544"
+      - "8081:8080" 
+    depends_on:
+      - mongo
+    healthcheck:
+      test: ["CMD", "curl", "-sk", "https://localhost:8080/heartbeat"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - openhim-network
+
+  # ===========================================
+  # OpenHIM Console
+  # ===========================================
+  openhim-console:
+    image: jembi/openhim-console:latest
+    container_name: openhim-console
+    volumes:
+      - ./openhim/default.json:/usr/share/nginx/html/config/default.json:ro
+    ports:
+      - "9000:80"
+    depends_on:
+      - openhim-core
+    networks:
+      - openhim-network
+
+  # ===========================================
+  # OpenCR
+  # ===========================================
+  opencr:
+    image: intrahealth/opencr
+    container_name: opencr
+    ports:
+      - "3004:3000"
+    depends_on:
+      - opencr-fhir
+      - opensearch
+    restart: always
+    entrypoint: ["/bin/sh", "/src/server/config/entrypoint.sh"]
+    environment:
+      - NODE_ENV=docker
+      - HAPI_FHIR_URL=https://hapifhir.alaga.online/fhir/metadata
+    volumes:
+      - ./opencr/config.json:/src/server/config/config_docker.json
+      - ./opencr/decisionRules.json:/src/server/config/decisionRules.json
+      - ./opencr/entrypoint.sh:/src/server/config/entrypoint.sh
+      - ./opencr/certs/server_cert.pem:/src/server/serverCertificates/server_cert.pem
+      - ./opencr/certs/server_key.pem:/src/server/serverCertificates/server_key.pem
+    networks:
+      - openhim-network
+      - opencr-network
+
+  # ===========================================
+  # OpenCR HAPI FHIR
+  # ===========================================
+  opencr-fhir:
+    image: hapiproject/hapi:latest
+    container_name: opencr-fhir
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://opencr-postgres:5432/hapi
+      SPRING_DATASOURCE_USERNAME: admin
+      SPRING_DATASOURCE_PASSWORD: admin
+      SPRING_DATASOURCE_DRIVER_CLASS_NAME: org.postgresql.Driver
+      SPRING_JPA_PROPERTIES_HIBERNATE_DIALECT: org.hibernate.dialect.PostgreSQLDialect
+    ports:
+      - "8090:8080"
+    depends_on:
+      opencr-postgres:
+        condition: service_healthy
+    networks:
+      openhim-network:
+      opencr-network:
+        aliases:
+          - fhir
+
+  # ===========================================
+  # PostgreSQL for OpenCR
+  # ===========================================
+  opencr-postgres:
+    image: postgres:15-alpine
+    container_name: opencr-postgres
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: hapi
+    volumes:
+      - opencr-postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - opencr-network
+
+  # ===========================================
+  # OpenSearch
+  # ===========================================
+  opensearch:
+    image: intrahealth/opensearch:latest
+    container_name: opensearch
+    environment:
+      - cluster.name=opencr-cluster
+      - node.name=opensearch-node1
+      - discovery.type=single-node
+      - bootstrap.memory_lock=true
+      - plugins.security.disabled=true
+      - "OPENSEARCH_JAVA_OPTS=-Xms512m -Xmx512m"
+    ulimits:
+      memlock:
+        soft: -1
+        hard: -1
+      nofile:
+        soft: 65536
+        hard: 65536
+    volumes:
+      - opensearch-data:/usr/share/opensearch/data
+    ports:
+      - "9200:9200"
+    networks:
+      - opencr-network
+
+  # ===========================================
+  # BridgeLink
+  # ===========================================
+  bridgelink:
+    image: innovarhealthcare/bridgelink:26.6.0
+    container_name: bridgelink
+    environment:
+      - MP_DATABASE=postgres
+      - MP_DATABASE_URL=jdbc:postgresql://bridgelink-db:5432/bridgelink
+      - MP_DATABASE_USERNAME=bridgelink
+      - MP_DATABASE_PASSWORD=bridgelink
+      - MP_DATABASE_DBNAME=bridgelink
+      - MP_DATABASE_MAX__CONNECTIONS=20
+      - MP_DATABASE_CONNECTION_MAXRETRY=3
+      - MP_DATABASE_RETRY_WAIT=10000
+      - MP_KEYSTORE_STOREPASS=changeme
+      - MP_KEYSTORE_KEYPASS=changeme
+      - MP_VMOPTIONS=512
+    ports:
+      - "8443:8443"
+      - "8082:8082"
+    depends_on:
+      bridgelink-db:
+        condition: service_healthy
+    networks:
+      - openhim-network
+    volumes:
+      - bridgelink-appdata:/opt/bridgelink/appdata
+
+  # ===========================================
+  # BridgeLink PostgreSQL
+  # ===========================================
+  bridgelink-db:
+    image: postgres:15-alpine
+    container_name: bridgelink-db
+    environment:
+      - POSTGRES_USER=bridgelink
+      - POSTGRES_PASSWORD=bridgelink
+      - POSTGRES_DB=bridgelink
+    volumes:
+      - bridgelink-postgres-data:/var/lib/postgresql/data
+    networks:
+      - openhim-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U bridgelink"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ===========================================
+  # Cloudflare Tunnel - HAPIFHIR
+  # ===========================================
+  cloudflared-tunnel:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared-tunnel
+    command: tunnel --no-autoupdate run --token ${TUNNEL_TOKEN}
+    restart: unless-stopped
+    networks:
+      - openhim-network
+  
+  # ===========================================
+  # Cloudflare Tunnel — OpenHIM 5001
+  # ===========================================
+  cloudflared-openhim:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared-openhim
+    command: tunnel --no-autoupdate run --token ${OPENHIM_TUNNEL_TOKEN}
+    restart: unless-stopped
+    networks:
+      - openhim-network
+
+  # ===========================================
+  # Cloudflare Tunnel — OpenHIM Console
+  # ===========================================
+  cloudflared-openhim-console:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared-openhim-console
+    command: tunnel --no-autoupdate run --token ${OPENHIM_TUNNEL_CONSOLE_TOKEN}
+    restart: unless-stopped
+    networks:
+      - openhim-network
+
+  # ===========================================
+  # Cloudflare Tunnel — OpenHIM Certificate
+  # ===========================================
+  cloudflared-openhim-certificate:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared-openhim-certificate
+    command: tunnel --no-autoupdate run --token ${OPENHIM_TUNNEL_CERTIFICATE_TOKEN}
+    restart: unless-stopped
+    networks:
+      - openhim-network
+
+  # ===========================================
+  # Cloudflare Tunnel — OpenHIM Core
+  # ===========================================
+  cloudflared-openhim-core:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared-openhim-core
+    command: tunnel --no-autoupdate run --token ${OPENHIM_TUNNEL_CORE_TOKEN}
+    restart: unless-stopped
+    networks:
+      - openhim-network
+
+  # ===========================================
+  # Cloudflare Tunnel — OpenHIM FHIR
+  # ===========================================
+  cloudflared-openhim-fhir:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared-openhim-fhir
+    command: tunnel --no-autoupdate run --token ${OPENHIM_TUNNEL_FHIR_TOKEN}
+    restart: unless-stopped
+    networks:
+      - openhim-network
+
+  # ===========================================
+  # Cloudflare Tunnel — OpenCR
+  # ===========================================
+  cloudflared-opencr:
+    image: cloudflare/cloudflared:latest
+    container_name: cloudflared-opencr
+    command: tunnel --no-autoupdate run --token ${OPENCR_TUNNEL_TOKEN}
+    restart: unless-stopped
+    networks:
+      - openhim-network
+
+volumes:
+  hapi-data:
+  postgres-data:
+  mongo-data:
+  opencr-postgres-data:
+  opensearch-data:
+  bridgelink-appdata:
+  bridgelink-postgres-data:
+
+networks:
+  openhim-network:
+    driver: bridge
+
+  opencr-network:
+    driver: bridge

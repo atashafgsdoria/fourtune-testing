@@ -1,0 +1,20 @@
+{
+  "version": "1.18.2",
+  "minimumCoreVersion": "5.2.0",
+  "protocol": "https",
+  "host": "openhim-api.alaga.online",
+  "hostPath": "",
+  "port": 443,
+  "title": "Open Health - OpenHIM Admin Console",
+  "footerTitle": "Open Health HIE",
+  "footerPoweredBy": "<a href='http://openhim.org/' target='_blank'>Powered by OpenHIM</a>",
+  "loginBanner": "",
+  "mediatorLastHeartbeatWarningSeconds": 60,
+  "mediatorLastHeartbeatDangerSeconds": 120,
+  "showLoginForm": true,
+  "ssoEnabled": false,
+  "api": {
+    "url": "https://alaga.online",
+    "trustSelfSignedCert": true
+  }
+}
